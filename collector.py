@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import shlex
+import ssl
 import socket
 import subprocess
 import sys
@@ -54,8 +55,13 @@ def load_env(path):
     for key in ('SUPPORT_INGEST_URL','SUPPORT_APP_ID','SUPPORT_APP_SECRET'):
         if not config.get(key):
             raise ValueError(key + ' is required')
+    verify = config.get('SUPPORT_TLS_VERIFY', 'true').lower()
+    if verify not in ('true', 'false'):
+        raise ValueError('SUPPORT_TLS_VERIFY must be true or false')
+    config['SUPPORT_TLS_VERIFY'] = verify == 'true'
     for key in ('SUPPORT_SERVICES','SUPPORT_NETWORK_INTERFACES'):
         config[key] = [x.strip() for x in config.get(key,'').split(',') if x.strip()]
+    config['SUPPORT_SERVICES'] = [name if name.endswith('.service') else name+'.service' for name in config['SUPPORT_SERVICES']]
     return config
 
 
@@ -90,8 +96,10 @@ def memory():
 
 
 def interfaces(configured):
-    if configured:
-        return configured
+    return configured or sorted(p.name for p in Path('/sys/class/net').iterdir())
+
+
+def uplinks():
     # Default routes identify uplinks without counting bridge members and veth peers.
     names = set()
     try:
@@ -169,27 +177,65 @@ def filesystems():
     items = []
     for line in read('/proc/self/mounts').splitlines():
         f = line.split()
-        if len(f)<4 or not f[0].startswith('/dev/'):
+        if len(f)<4 or (not f[0].startswith('/dev/') and f[1] != '/'):
             continue
         device, mount, kind = [x.replace('\\040',' ').replace('\\011','\t').replace('\\134','\\') for x in f[:3]]
         try:
             s = os.statvfs(mount)
-            items.append({'device':device,'mount_point':mount,'filesystem_type':kind,'capacity_bytes':s.f_blocks*s.f_frsize,'free_bytes':s.f_bfree*s.f_frsize,'available_bytes':s.f_bavail*s.f_frsize,'inodes_total':s.f_files,'inodes_free':s.f_ffree})
+            items.append({'device':device,'mount_point':mount,'filesystem_type':kind,'capacity_bytes':s.f_blocks*s.f_frsize,'free_bytes':s.f_bfree*s.f_frsize,'available_bytes':s.f_bavail*s.f_frsize,'inodes_total':s.f_files,'inodes_free':s.f_ffree,'read_only':'ro' in f[3].split(',')})
         except OSError:
             continue
     return items
 
 
 def system_services(configured):
-    output = command(['systemctl','list-units','--failed','--all','--plain','--no-legend','--no-pager'])
+    args = ['systemctl','list-units','--all','--type=service','--plain','--no-legend','--no-pager']
+    if configured: args.append('--failed')
+    output = command(args)
     names = set(configured)
     names.update(line.split()[0] for line in output.splitlines() if line.split() and line.split()[0].endswith('.service'))
     result = []
     for name in sorted(names):
-        raw = command(['systemctl','show',name,'--no-pager','--property=Id,LoadState,ActiveState,SubState,Result,ExecMainStatus,NRestarts'])
-        d = dict(line.split('=',1) for line in raw.splitlines() if '=' in line)
-        result.append({'unit':d.get('Id',name),'load_state':d.get('LoadState','unknown'),'active_state':d.get('ActiveState','unknown'),'substate':d.get('SubState','unknown'),'result':d.get('Result','unknown'),'exit_code':d.get('ExecMainStatus','unknown'),'restart_count':d.get('NRestarts','unknown')})
+        shown = subprocess.run(['systemctl','show','--no-pager','--property=Id,Names,Type,LoadState,ActiveState,SubState,Result,ExecMainStatus,NRestarts','--',name],capture_output=True,text=True,timeout=8,check=False)
+        d = dict(line.split('=',1) for line in shown.stdout.splitlines() if '=' in line)
+        # Missing configured units still have useful properties on systemctl versions that exit nonzero.
+        if (shown.returncode and d.get('LoadState') != 'not-found') or not d.get('LoadState') or not d.get('ActiveState'):
+            raise RuntimeError('systemctl show %s failed: %s' % (name, bounded(shown.stderr.strip(),300)))
+        aliases = set(d.get('Names','').split()) | {name,d.get('Id',name)}
+        result.append({'unit':d.get('Id',name),'configured':bool(aliases.intersection(configured)),'service_type':d.get('Type','unknown'),'load_state':d['LoadState'],'active_state':d['ActiveState'],'substate':d.get('SubState','unknown'),'result':d.get('Result','unknown'),'exit_code':d.get('ExecMainStatus','unknown'),'restart_count':d.get('NRestarts','unknown')})
     return result
+
+
+def service_health(service):
+    load, active = service['load_state'], service['active_state']
+    detail = 'service %s: %s/%s, load=%s, result=%s, exit=%s' % (service['unit'], active, service['substate'], load, service['result'], service['exit_code'])
+    if active == 'failed' or load in ('error','bad-setting'):
+        return 'unhealthy', detail
+    if load in ('masked','not-found'):
+        return ('unhealthy', detail) if service['configured'] else None
+    if load != 'loaded' or active not in ('active','inactive','activating','deactivating','reloading','refreshing'):
+        return 'degraded', detail
+    if service['substate'] in ('auto-restart','auto-restart-queued'):
+        return 'degraded', detail
+    if service['configured'] and active in ('inactive','deactivating'):
+        if active == 'inactive' and service['service_type'] == 'oneshot' and service['result'] == 'success':
+            return None
+        return 'unhealthy', detail
+    return None
+
+
+def filesystem_health(items):
+    issues = []
+    for item in items:
+        if item.get('read_only'):
+            continue
+        for label, total, free in (('space', item['capacity_bytes'], item['available_bytes']), ('inodes', item['inodes_total'], item['inodes_free'])):
+            if total <= 0:
+                continue
+            usage = 100*(total-max(0,free))/total
+            if usage >= 90:
+                issues.append(('unhealthy' if usage >= 98 else 'degraded', 'filesystem %s: %s %.1f%% used' % (item['mount_point'],label,usage)))
+    return issues
 
 
 def hardware():
@@ -231,7 +277,7 @@ def journal_samples(entry, services):
     streams = ['journal_logs']
     if priority <= 4: streams.append('system_logs')
     if entry.get('_TRANSPORT') == 'kernel': streams.append('kernel_logs')
-    if entry.get('_SYSTEMD_UNIT') in services or entry.get('SYSLOG_IDENTIFIER') in services: streams.append('service_logs')
+    if entry.get('_SYSTEMD_UNIT') in services or entry.get('SYSLOG_IDENTIFIER') in services or (not services and str(entry.get('_SYSTEMD_UNIT','')).endswith('.service')): streams.append('service_logs')
     return [{'stream':s,'timestamp':stamp,'value':{'message':message,'severity':severity}} for s in streams]
 
 
@@ -239,7 +285,8 @@ class Collector:
     def __init__(self, config):
         self.config = config; STATE.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.pending = queue.Queue(maxsize=2000); self.stop = threading.Event(); self.service_changed = threading.Event()
-        self.errors = {}; self.failed = {}; self.previous_services = None
+        self.errors = {}; self.failed = {}
+        self.health_checks = {name:[('degraded',name+' check pending')] for name in ('services','filesystems','hardware')}
         self.old_cpu = None; self.old_net = {}; self.old_proc = {}; self.old_time = None
         self.last_info = None; self.mounts = None; self.links = None
         self.state = {}
@@ -304,9 +351,10 @@ class Collector:
                 if old and elapsed:
                     rx = rate(old['rx_bytes'],item['rx_bytes'],elapsed); tx = rate(old['tx_bytes'],item['tx_bytes'],elapsed)
                     if rx is not None and tx is not None: self.net_rates[name] = (rx,tx)
-            if self.net_rates and len(self.net_rates)==len(net):
-                self.emit('network_receive_bytes_per_second',sum(v[0] for v in self.net_rates.values()))
-                self.emit('network_transmit_bytes_per_second',sum(v[1] for v in self.net_rates.values()))
+            aggregate = self.config['SUPPORT_NETWORK_INTERFACES'] or uplinks()
+            if aggregate and all(name in self.net_rates for name in aggregate):
+                self.emit('network_receive_bytes_per_second',sum(self.net_rates[name][0] for name in aggregate))
+                self.emit('network_transmit_bytes_per_second',sum(self.net_rates[name][1] for name in aggregate))
             self.old_net = net
         proc = self.collect('processes',processes)
         if proc is not None:
@@ -321,11 +369,12 @@ class Collector:
         if mounts is not None:
             current = {(x['device'],x['mount_point'],x['filesystem_type']) for x in mounts}
             if self.mounts is not None and current != self.mounts: self.event('machine_events','Mounts changed',{'added':sorted(current-self.mounts),'removed':sorted(self.mounts-current)})
+            self.health_checks['filesystems'] = filesystem_health(mounts)
             self.mounts = current; self.event('filesystems',f'{len(mounts)} mounted filesystems',{'items':mounts})
         try: addresses = json.loads(command(['ip','-j','address','show']))
         except (OSError,RuntimeError,ValueError,subprocess.TimeoutExpired): addresses = None
         addr = {x['ifname']:[a['local']+'/'+str(a['prefixlen']) for a in x.get('addr_info',[]) if 'local' in a] for x in (addresses or [])}
-        links = self.collect('network links',lambda: network([p.name for p in Path('/sys/class/net').iterdir() if p.name != 'lo']))
+        links = self.collect('network links',lambda: network(interfaces(self.config['SUPPORT_NETWORK_INTERFACES'])))
         if links is not None:
             current = {k:v['state'] for k,v in links.items()}
             if self.links is not None:
@@ -341,21 +390,22 @@ class Collector:
         if getattr(self,'top',None) is not None: self.event('top_processes',f'{len(self.top)} top processes',{'items':self.top})
         services = self.collect('services',lambda: system_services(self.config['SUPPORT_SERVICES']))
         if services is not None:
-            states = {s['unit']:s for s in services}; self.failed = {k:v for k,v in states.items() if v['active_state']=='failed' or v['load_state'] != 'loaded' or (k in self.config['SUPPORT_SERVICES'] and v['active_state'] not in ('active','activating'))}
-            if self.previous_services is not None:
-                for unit in sorted(set(self.previous_services)|set(states)):
-                    previous = self.previous_services.get(unit); current = states.get(unit)
-                    was_failed = bool(previous and previous['active_state']=='failed')
-                    is_failed = bool(current and current['active_state']=='failed')
-                    if was_failed != is_failed:
-                        detail = current or previous; self.event('service_failures',unit+(' failed' if is_failed else ' recovered'),{**detail,'state':'failed' if is_failed else 'recovered','diagnostic_message':f"{unit} {detail['active_state']} ({detail['result']})"})
-            else:
-                for unit, detail in states.items():
-                    if detail['active_state']=='failed': self.event('service_failures',unit+' failed',{**detail,'state':'failed','diagnostic_message':f"{unit} failed ({detail['result']})"})
-            self.previous_services = states
+            issues = [(service,service_health(service)) for service in services]
+            self.health_checks['services'] = [issue for _,issue in issues if issue is not None]
+            failed = {service['unit']:service for service,issue in issues if issue and issue[0] == 'unhealthy'}
+            for unit in sorted(set(self.failed)|set(failed)):
+                if (unit in self.failed) != (unit in failed):
+                    detail = failed.get(unit) or next((s for s in services if s['unit']==unit),self.failed.get(unit))
+                    state = 'failed' if unit in failed else 'recovered'
+                    reason = service_health(detail)
+                    message = reason[1] if state == 'failed' else unit+' no longer reports an unhealthy state'
+                    self.event('service_failures',unit+' '+state,{**detail,'state':state,'diagnostic_message':message})
+            self.failed = failed
             self.event('services',f'{len(services)} services',{'items':services})
         hw = self.collect('hardware',hardware)
-        if hw is not None: self.event('hardware','Hardware status',hw)
+        if hw is not None:
+            self.health_checks['hardware'] = [('unhealthy','disk %s: SMART health check failed' % disk['device']) for disk in hw['disk_health'] if disk.get('passed') is False]
+            self.event('hardware','Hardware status',hw)
         if self.boot_event:
             self.event('machine_events','Machine rebooted',{'boot_id':self.session_boot}); self.boot_event = False
 
@@ -381,6 +431,12 @@ class Collector:
                 self.errors['journal'] = 'journal reader: '+str(exc); logging.error('%s',self.errors['journal'])
             self.stop.wait(5)
 
+    def health(self):
+        issues = [issue for checks in self.health_checks.copy().values() for issue in checks]
+        issues.extend(('degraded',message) for message in self.errors.copy().values())
+        issues.sort(key=lambda issue: 0 if issue[0] == 'unhealthy' else 1)
+        return {'status':issues[0][0] if issues else 'healthy','message':bounded('; '.join(message for _,message in issues),1024)}
+
     def deliver(self):
         batch = []; size = 0; backoff = 1; next_heartbeat = 0; carry = None
         while not self.stop.is_set():
@@ -395,12 +451,10 @@ class Collector:
                     batch.append(item); size += n
             except queue.Empty: pass
             if not batch and not heartbeat: continue
-            status = 'unhealthy' if self.failed else 'degraded' if self.errors else 'healthy'
-            msg = '; '.join(list(self.errors.values()) + ['service '+x+' is not healthy' for x in self.failed])[:1024]
-            body = {'heartbeat':heartbeat,'streams':list(STREAMS.values()),'samples':[x[0] for x in batch],'health':{'status':status,'message':msg}}
+            body = {'heartbeat':heartbeat,'streams':list(STREAMS.values()),'samples':[x[0] for x in batch],'health':self.health()}
             request = urllib.request.Request(self.config['SUPPORT_INGEST_URL'],data=json.dumps(body,ensure_ascii=True).encode(),headers={'X-App-ID':self.config['SUPPORT_APP_ID'],'Authorization':'Bearer '+self.config['SUPPORT_APP_SECRET'],'Content-Type':'application/json'},method='POST')
             try:
-                with urllib.request.urlopen(request,timeout=10) as response:
+                with urllib.request.urlopen(request, timeout=10, context=None if self.config.get('SUPPORT_TLS_VERIFY', True) else ssl._create_unverified_context()) as response:
                     if not 200 <= response.status < 300: raise RuntimeError('HTTP '+str(response.status))
                 for sample, cursor in batch:
                     if cursor: self.state['cursor'] = cursor
